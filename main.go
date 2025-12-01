@@ -2,18 +2,23 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 type Node struct {
-	Name     string
-	Children map[string]*Node
+	Name        string
+	Description string
+	Children    map[string]*Node
 }
 
 func NewNode(name string) *Node {
@@ -27,18 +32,27 @@ func main() {
 	var packagePath string
 	var packageName string
 	var exportMode bool
+	var fetchDesc bool
+	var githubToken string
 	flag.StringVar(&packagePath, "path", ".", "Path to the Go package (default: current directory)")
 	flag.StringVar(&packageName, "package", "", "Package name to fetch and analyze (e.g., github.com/spf13/cobra)")
 	flag.BoolVar(&exportMode, "export", false, "Export as flat list sorted by name with no duplicates")
+	flag.BoolVar(&fetchDesc, "desc", false, "Fetch and display GitHub repository descriptions")
+	flag.StringVar(&githubToken, "token", "", "GitHub personal access token (or use GITHUB_TOKEN env var)")
 	flag.Parse()
 
-	if err := run(packagePath, packageName, exportMode); err != nil {
+	// Use environment variable if token not provided via flag
+	if githubToken == "" {
+		githubToken = os.Getenv("GITHUB_TOKEN")
+	}
+
+	if err := run(packagePath, packageName, exportMode, fetchDesc, githubToken); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(packagePath, packageName string, exportMode bool) error {
+func run(packagePath, packageName string, exportMode, fetchDesc bool, githubToken string) error {
 	var workDir string
 	var cleanup bool
 
@@ -74,11 +88,16 @@ func run(packagePath, packageName string, exportMode bool) error {
 		return nil
 	}
 
+	tree := buildDependencyTree(deps, packageName)
+
+	if fetchDesc {
+		fetchDescriptions(tree, githubToken)
+	}
+
 	if exportMode {
-		printExport(deps)
+		printExport(deps, fetchDesc, githubToken)
 	} else {
-		tree := buildDependencyTree(deps, packageName)
-		printTree(tree)
+		printTree(tree, fetchDesc)
 	}
 
 	return nil
@@ -134,6 +153,111 @@ func getModuleDependencies(packagePath string) (map[string][]string, error) {
 	}
 
 	return deps, nil
+}
+
+type GitHubRepo struct {
+	Description string `json:"description"`
+}
+
+func extractGitHubRepo(modulePath string) (owner, repo string, ok bool) {
+	// Remove version suffix if present
+	parts := strings.Split(modulePath, "@")
+	path := parts[0]
+
+	// Check if it's a GitHub module
+	if !strings.HasPrefix(path, "github.com/") {
+		return "", "", false
+	}
+
+	// Extract owner and repo (handle subpackages)
+	pathParts := strings.Split(strings.TrimPrefix(path, "github.com/"), "/")
+	if len(pathParts) < 2 {
+		return "", "", false
+	}
+
+	return pathParts[0], pathParts[1], true
+}
+
+func fetchGitHubDescription(modulePath, token string) (string, error) {
+	owner, repo, ok := extractGitHubRepo(modulePath)
+	if !ok {
+		return "", fmt.Errorf("not a GitHub module")
+	}
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo)
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set User-Agent to avoid GitHub API rate limiting issues
+	req.Header.Set("User-Agent", "deptree-cli")
+
+	// Add authentication if token is provided
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch from GitHub API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+	}
+
+	var ghRepo GitHubRepo
+	if err := json.NewDecoder(resp.Body).Decode(&ghRepo); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if ghRepo.Description == "" {
+		return "", fmt.Errorf("no description set")
+	}
+
+	return ghRepo.Description, nil
+}
+
+func fetchDescriptions(root *Node, token string) {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	// Collect all unique modules
+	modules := make(map[string]*Node)
+	var collectModules func(*Node)
+	collectModules = func(node *Node) {
+		mu.Lock()
+		modules[node.Name] = node
+		mu.Unlock()
+
+		for _, child := range node.Children {
+			collectModules(child)
+		}
+	}
+	collectModules(root)
+
+	// Fetch descriptions concurrently
+	for _, node := range modules {
+		wg.Add(1)
+		go func(n *Node) {
+			defer wg.Done()
+			desc, err := fetchGitHubDescription(n.Name, token)
+			mu.Lock()
+			if err != nil {
+				// Store error message as description for display
+				n.Description = fmt.Sprintf("(%s)", err.Error())
+			} else {
+				n.Description = desc
+			}
+			mu.Unlock()
+		}(node)
+	}
+
+	wg.Wait()
 }
 
 func buildDependencyTree(deps map[string][]string, requestedPackage string) *Node {
@@ -193,12 +317,16 @@ func buildTree(node *Node, deps map[string][]string, visited map[string]bool) {
 	}
 }
 
-func printTree(node *Node) {
-	fmt.Println(node.Name)
-	printNode(node, "")
+func printTree(node *Node, showDesc bool) {
+	if showDesc && node.Description != "" {
+		fmt.Printf("%s - %s\n", node.Name, node.Description)
+	} else {
+		fmt.Println(node.Name)
+	}
+	printNode(node, "", showDesc)
 }
 
-func printNode(node *Node, prefix string) {
+func printNode(node *Node, prefix string, showDesc bool) {
 	childCount := len(node.Children)
 
 	var childNames []string
@@ -220,12 +348,16 @@ func printNode(node *Node, prefix string) {
 			childPrefix = prefix + "│   "
 		}
 
-		fmt.Printf("%s%s%s\n", prefix, connector, child.Name)
-		printNode(child, childPrefix)
+		if showDesc && child.Description != "" {
+			fmt.Printf("%s%s%s - %s\n", prefix, connector, child.Name, child.Description)
+		} else {
+			fmt.Printf("%s%s%s\n", prefix, connector, child.Name)
+		}
+		printNode(child, childPrefix, showDesc)
 	}
 }
 
-func printExport(deps map[string][]string) {
+func printExport(deps map[string][]string, showDesc bool, token string) {
 	uniqueDeps := make(map[string]bool)
 
 	for from, tos := range deps {
@@ -248,8 +380,39 @@ func printExport(deps map[string][]string) {
 
 	sort.Strings(depList)
 
-	for _, dep := range depList {
-		fmt.Println(dep)
+	if showDesc {
+		// Fetch descriptions concurrently for export mode
+		descriptions := make(map[string]string)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+
+		for _, dep := range depList {
+			wg.Add(1)
+			go func(d string) {
+				defer wg.Done()
+				desc, err := fetchGitHubDescription(d, token)
+				mu.Lock()
+				if err != nil {
+					descriptions[d] = fmt.Sprintf("(%s)", err.Error())
+				} else {
+					descriptions[d] = desc
+				}
+				mu.Unlock()
+			}(dep)
+		}
+		wg.Wait()
+
+		for _, dep := range depList {
+			if desc, ok := descriptions[dep]; ok {
+				fmt.Printf("%s - %s\n", dep, desc)
+			} else {
+				fmt.Println(dep)
+			}
+		}
+	} else {
+		for _, dep := range depList {
+			fmt.Println(dep)
+		}
 	}
 }
 
